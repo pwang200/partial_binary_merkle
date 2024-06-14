@@ -98,12 +98,12 @@ impl Inner {
         hasher.finalize().as_slice().try_into().expect("Hash")
     }
 }
-
-fn hash_of_default_hash() -> Hash {
-    let mut hasher = DefaultHasher::new();
-    hasher.update(Hash::default());
-    hasher.finalize().as_slice().try_into().expect("Hash")
-}
+//
+// fn hash_of_default_hash() -> Hash {
+//     let mut hasher = DefaultHasher::new();
+//     hasher.update(Hash::default());
+//     hasher.finalize().as_slice().try_into().expect("Hash")
+// }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Proof {
@@ -178,19 +178,76 @@ impl PartialMerkleTrie {
         self.root_dirty = false;
     }
 
+    pub fn get(&self, id: &ID) -> Option<ValueHash> {
+        match self.leaf_count
+        {
+            n if n == 0 => {}
+            n if n == 1 => {
+                let node = self.inner_store.get(&self.root).expect("node not exist");
+                match &node.r {
+                    Child::Leaf(l) => {
+                        if l.id == *id {
+                            return Some(l.hash);
+                        }
+                    }
+                    Child::SubRoot(_) => { panic!("subtree should not exist") }
+                }
+            }
+            _ => {
+                let mut cur_node_id = &self.root;
+                loop {
+                    let current = self.inner_store.get(cur_node_id).expect("node not exist");
+                    let (cp_len, a_is_left) = common_prefix_len(&id, &current.r_id);
+                    match cp_len {
+                        n if n < current.cp_len => {
+                            break;
+                        }
+                        n if n == current.cp_len && a_is_left => {
+                            match &current.l {
+                                Child::Leaf(l) => {
+                                    if *id == l.id {
+                                        return Some(l.hash);
+                                    }
+                                    break;
+                                }
+                                Child::SubRoot(sr) => {
+                                    cur_node_id = sr;
+                                }
+                            }
+                        }
+                        _ => {
+                            match &current.r {
+                                Child::Leaf(l) => {
+                                    if *id == l.id {
+                                        return Some(l.hash);
+                                    }
+                                    break;
+                                }
+                                Child::SubRoot(sr) => {
+                                    cur_node_id = sr;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn get_proof(&self, id: &ID) -> Option<Proof> {
         match self.leaf_count
         {
             n if n == 0 => {}
             n if n == 1 => {
-                let node = self.inner_store.get(id).expect("node not exist");
+                let node = self.inner_store.get(&self.root).expect("node not exist");
                 match &node.r {
                     Child::Leaf(l) => {
                         if l.id == *id {
                             return Some(Proof {
                                 // root: self.root,
                                 v_hash: l.hash,
-                                path: vec![(true, hash_of_default_hash())],
+                                path: vec![(true, NodeIDHash::default())],
                             });
                         }
                     }
@@ -250,7 +307,7 @@ impl PartialMerkleTrie {
         return None;
     }
 
-    pub fn get_partial(&self, ids: Vec<&ID>) -> PartialMerkleTrie {
+    pub fn get_partial(&self, ids: &Vec<&ID>) -> PartialMerkleTrie {
         assert!(!self.root_dirty);
         let mut partial = PartialMerkleTrie {
             root: self.root,
@@ -264,7 +321,7 @@ impl PartialMerkleTrie {
             return partial;
         }
 
-        for id in ids {
+        for &id in ids {
             let mut cur_node_id = &self.root;
             loop {
                 let current = if !partial.inner_store.contains_key(cur_node_id) {
@@ -313,9 +370,30 @@ impl PartialMerkleTrie {
                 return self.root == Hash::default() && self.inner_store.len() == 0;
             }
             n if n <= 2 => {
-                return self.inner_store.len() == 1 &&
-                    self.inner_store.get(&self.root).unwrap().hash() == self.root;
-                //verify both children are leaves?
+                let inner = self.inner_store.get(&self.root);
+                match inner {
+                    None => {
+                        return false;
+                    }
+                    Some(i) => {
+                        match &i.l {
+                            Child::Leaf(_) => {}
+                            Child::SubRoot(_) => {
+                                return false;
+                            }
+                        }
+                        match &i.r {
+                            Child::Leaf(_) => {}
+                            Child::SubRoot(_) => {
+                                return false;
+                            }
+                        }
+                        if !(self.inner_store.len() == 1 && i.hash() == self.root) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
             }
             _ => {
                 let mut node_ids = HashSet::new();
@@ -534,7 +612,7 @@ mod tests {
 
     #[allow(dead_code)]
     #[test]
-    fn insert_or_replace_works() {
+    fn trie_works() {
         let mut temp = Hash::default();
         temp[4] = 255;
         let (k_1, v_1) = create_key_value(1);
@@ -549,159 +627,166 @@ mod tests {
         let (k_254, v_254) = create_key_value(254);
         let (k_255, v_255) = create_key_value(255);
 
+        // single inserts
         let mut tr = PartialMerkleTrie::new();
         {
-            // println!("ri insert key      255");
-            tr.insert_or_replace(k_255, temp);//need clone?
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      255");
-            tr.insert_or_replace(k_255, v_255);
-            assert_eq!(tr.leaf_count, 1);
-            assert_eq!(tr.inner_store.len(), 1);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      254");
-            tr.insert_or_replace(k_254, temp);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      254");
-            tr.insert_or_replace(k_254, v_254);
-            assert_eq!(tr.leaf_count, 2);
-            assert_eq!(tr.inner_store.len(), 1);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      1");
-            tr.insert_or_replace(k_1, temp);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      1");
-            tr.insert_or_replace(k_1, v_1);
-            assert_eq!(tr.leaf_count, 3);
-            assert_eq!(tr.inner_store.len(), 2);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      2");
-            tr.insert_or_replace(k_2, temp);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      2");
-            tr.insert_or_replace(k_2, v_2);
-            assert_eq!(tr.leaf_count, 4);
-            assert_eq!(tr.inner_store.len(), 3);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      128");
-            tr.insert_or_replace(k_128, temp);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      128");
-            tr.insert_or_replace(k_128, v_128);
-            assert_eq!(tr.leaf_count, 5);
-            assert_eq!(tr.inner_store.len(), 4);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      64");
-            tr.insert_or_replace(k_64, temp);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      64");
-            tr.insert_or_replace(k_64, v_64);
-            assert_eq!(tr.leaf_count, 6);
-            assert_eq!(tr.inner_store.len(), 5);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      3");
-            tr.insert_or_replace(k_3, temp);
-            // println!("root               {:?}", tr.root);
-            // println!("ri insert key      3");
-            tr.insert_or_replace(k_3, v_3);
-            // println!("root               {:?}", tr.root);
-            assert_eq!(tr.leaf_count, 7);
-            assert_eq!(tr.inner_store.len(), 6);
+            {
+                // println!("ri insert key      255");
+                tr.insert_or_replace(k_255, temp);//need clone?
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      255");
+                tr.insert_or_replace(k_255, v_255);
+                assert_eq!(tr.leaf_count, 1);
+                assert_eq!(tr.inner_store.len(), 1);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      254");
+                tr.insert_or_replace(k_254, temp);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      254");
+                tr.insert_or_replace(k_254, v_254);
+                assert_eq!(tr.leaf_count, 2);
+                assert_eq!(tr.inner_store.len(), 1);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      1");
+                tr.insert_or_replace(k_1, temp);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      1");
+                tr.insert_or_replace(k_1, v_1);
+                assert_eq!(tr.leaf_count, 3);
+                assert_eq!(tr.inner_store.len(), 2);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      2");
+                tr.insert_or_replace(k_2, temp);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      2");
+                tr.insert_or_replace(k_2, v_2);
+                assert_eq!(tr.leaf_count, 4);
+                assert_eq!(tr.inner_store.len(), 3);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      128");
+                tr.insert_or_replace(k_128, temp);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      128");
+                tr.insert_or_replace(k_128, v_128);
+                assert_eq!(tr.leaf_count, 5);
+                assert_eq!(tr.inner_store.len(), 4);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      64");
+                tr.insert_or_replace(k_64, temp);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      64");
+                tr.insert_or_replace(k_64, v_64);
+                assert_eq!(tr.leaf_count, 6);
+                assert_eq!(tr.inner_store.len(), 5);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      3");
+                tr.insert_or_replace(k_3, temp);
+                // println!("root               {:?}", tr.root);
+                // println!("ri insert key      3");
+                tr.insert_or_replace(k_3, v_3);
+                // println!("root               {:?}", tr.root);
+                assert_eq!(tr.leaf_count, 7);
+                assert_eq!(tr.inner_store.len(), 6);
+            }
+
+            {
+                let mut td = PartialMerkleTrie::new();
+                td.insert_or_replace(k_1, temp);
+                td.insert_or_replace(k_1, v_1);
+                td.insert_or_replace(k_2, temp);
+                td.insert_or_replace(k_2, v_2);
+                td.insert_or_replace(k_3, temp);
+                td.insert_or_replace(k_3, v_3);
+                td.insert_or_replace(k_64, temp);
+                td.insert_or_replace(k_64, v_64);
+                td.insert_or_replace(k_128, temp);
+                td.insert_or_replace(k_128, v_128);
+                td.insert_or_replace(k_254, temp);
+                td.insert_or_replace(k_254, v_254);
+                td.insert_or_replace(k_255, temp);
+                td.insert_or_replace(k_255, v_255);
+                assert_eq!(td.leaf_count, 7);
+                assert_eq!(td.inner_store.len(), 6);
+                assert_eq!(tr.root, td.root);
+            }
+
+            {
+                let mut td = PartialMerkleTrie::new();
+                td.insert_or_replace(k_255, temp);
+                td.insert_or_replace(k_255, v_255);
+                td.insert_or_replace(k_254, temp);
+                td.insert_or_replace(k_254, v_254);
+                td.insert_or_replace(k_128, temp);
+                td.insert_or_replace(k_128, v_128);
+                td.insert_or_replace(k_64, temp);
+                td.insert_or_replace(k_64, v_64);
+                td.insert_or_replace(k_3, temp);
+                td.insert_or_replace(k_3, v_3);
+                td.insert_or_replace(k_2, temp);
+                td.insert_or_replace(k_2, v_2);
+                td.insert_or_replace(k_1, temp);
+                td.insert_or_replace(k_1, v_1);
+                assert_eq!(td.leaf_count, 7);
+                assert_eq!(td.inner_store.len(), 6);
+                assert_eq!(tr.root, td.root);
+            }
         }
 
+        // batch inserts
         {
-            let mut td = PartialMerkleTrie::new();
-            td.insert_or_replace(k_1, temp);
-            td.insert_or_replace(k_1, v_1);
-            td.insert_or_replace(k_2, temp);
-            td.insert_or_replace(k_2, v_2);
-            td.insert_or_replace(k_3, temp);
-            td.insert_or_replace(k_3, v_3);
-            td.insert_or_replace(k_64, temp);
-            td.insert_or_replace(k_64, v_64);
-            td.insert_or_replace(k_128, temp);
-            td.insert_or_replace(k_128, v_128);
-            td.insert_or_replace(k_254, temp);
-            td.insert_or_replace(k_254, v_254);
-            td.insert_or_replace(k_255, temp);
-            td.insert_or_replace(k_255, v_255);
-            assert_eq!(td.leaf_count, 7);
-            assert_eq!(td.inner_store.len(), 6);
-            assert_eq!(tr.root, td.root);
+            {
+                let items: Vec<(ID, Hash)> = vec![
+                    (k_1, v_1), (k_2, v_2), (k_3, v_3), (k_64, v_64),
+                    (k_128, v_128), (k_254, v_254), (k_255, v_255),
+                ];
+                let mut td = PartialMerkleTrie::new();
+                td.insert_or_replace_batch(items);
+                assert_eq!(td.leaf_count, 7);
+                assert_eq!(td.inner_store.len(), 6);
+                // println!("tr root            {:?}", tr.root);
+                // println!("td root            {:?}", td.root);
+                assert_eq!(tr.root, td.root);
+            }
+
+            {
+                let items: Vec<(ID, Hash)> = vec![
+                    (k_255, v_255), (k_254, v_254), (k_128, v_128),
+                    (k_64, v_64), (k_3, v_3), (k_2, v_2), (k_1, v_1),
+                ];
+                let mut td = PartialMerkleTrie::new();
+                td.insert_or_replace_batch(items);
+                assert_eq!(td.leaf_count, 7);
+                assert_eq!(td.inner_store.len(), 6);
+                // println!("tr root            {:?}", tr.root);
+                // println!("td root            {:?}", td.root);
+                assert_eq!(tr.root, td.root);
+            }
         }
 
-        {
-            let mut td = PartialMerkleTrie::new();
-            td.insert_or_replace(k_255, temp);
-            td.insert_or_replace(k_255, v_255);
-            td.insert_or_replace(k_254, temp);
-            td.insert_or_replace(k_254, v_254);
-            td.insert_or_replace(k_128, temp);
-            td.insert_or_replace(k_128, v_128);
-            td.insert_or_replace(k_64, temp);
-            td.insert_or_replace(k_64, v_64);
-            td.insert_or_replace(k_3, temp);
-            td.insert_or_replace(k_3, v_3);
-            td.insert_or_replace(k_2, temp);
-            td.insert_or_replace(k_2, v_2);
-            td.insert_or_replace(k_1, temp);
-            td.insert_or_replace(k_1, v_1);
-            assert_eq!(td.leaf_count, 7);
-            assert_eq!(td.inner_store.len(), 6);
-            assert_eq!(tr.root, td.root);
-        }
-
-        {
-            let items: Vec<(ID, Hash)> = vec![
-                (k_1, v_1), (k_2, v_2), (k_3, v_3), (k_64, v_64),
-                (k_128, v_128), (k_254, v_254), (k_255, v_255),
-            ];
-            let mut td = PartialMerkleTrie::new();
-            td.insert_or_replace_batch(items);
-            assert_eq!(td.leaf_count, 7);
-            assert_eq!(td.inner_store.len(), 6);
-            // println!("tr root            {:?}", tr.root);
-            // println!("td root            {:?}", td.root);
-            assert_eq!(tr.root, td.root);
-        }
-
-        {
-            let items: Vec<(ID, Hash)> = vec![
-                (k_255, v_255), (k_254, v_254), (k_128, v_128),
-                (k_64, v_64), (k_3, v_3), (k_2, v_2), (k_1, v_1),
-            ];
-            let mut td = PartialMerkleTrie::new();
-            td.insert_or_replace_batch(items);
-            assert_eq!(td.leaf_count, 7);
-            assert_eq!(td.inner_store.len(), 6);
-            // println!("tr root            {:?}", tr.root);
-            // println!("td root            {:?}", td.root);
-            assert_eq!(tr.root, td.root);
-        }
-
+        // partial trie
         {
             let ids = vec![&k_1, &k_2, &k_3, &k_64, &k_128, &k_254, &k_255];
-            let tp = tr.get_partial(ids);
+            let tp = tr.get_partial(&ids);
             assert_eq!(tp.inner_store.len(), 6);
             assert!(tp.verify_partial());
 
             let ids = vec![&k_255, &k_254, &k_128, &k_64, &k_3, &k_2, &k_1];
-            let tp = tr.get_partial(ids);
+            let tp = tr.get_partial(&ids);
             assert_eq!(tp.inner_store.len(), 6);
             assert!(tp.verify_partial());
 
             let ids = vec![&k_64];
-            let tp = tr.get_partial(ids);
+            let tp = tr.get_partial(&ids);
             assert_eq!(tp.inner_store.len(), 2);
             assert!(tp.verify_partial());
 
             let ids = vec![];
-            let tp = tr.get_partial(ids);
+            let tp = tr.get_partial(&ids);
             assert_eq!(tp.inner_store.len(), 0);
             assert!(tp.verify_partial());
 
             let ids = vec![&k_32];
-            let mut tp = tr.get_partial(ids);
+            let mut tp = tr.get_partial(&ids);
             assert_eq!(tp.inner_store.len(), 3);
             assert!(tp.verify_partial());
             tr.insert_or_replace(k_32, v_32);//need clone?
@@ -710,15 +795,13 @@ mod tests {
             assert!(tp.verify_partial());
 
             let ids = vec![&k_85, &k_130, &k_200];
-            let mut tp = tr.get_partial(ids);
+            let mut tp = tr.get_partial(&ids);
             assert_eq!(tp.inner_store.len(), 4);
             assert!(tp.verify_partial());
 
             tr.insert_or_replace(k_85, v_85);
             tr.insert_or_replace(k_130, v_130);
             tr.insert_or_replace(k_200, v_200);
-
-
             tp.insert_or_replace_batch(vec![(k_85, v_85), (k_130, v_130), (k_200, v_200)]);
 
             assert_eq!(tp.root, tr.root);
@@ -730,13 +813,54 @@ mod tests {
             assert!(!tp.verify_partial());
         }
 
+        // Merkle proof
         {
-            let id = Hash::default();
-            assert!(tr.get_proof(&id).is_none());
-            let ids = vec![&k_1, &k_2, &k_3, &k_32, &k_64, &k_85, &k_128, &k_130, &k_200, &k_254, &k_255];
-            for id in ids {
-                let p = tr.get_proof(id).unwrap();
-                assert!(p.verify(&tr.root));
+            {
+                let id = Hash::default();
+                assert!(tr.get_proof(&id).is_none());
+                let ids = vec![&k_1, &k_2, &k_3, &k_32, &k_64, &k_85, &k_128, &k_130, &k_200, &k_254, &k_255];
+                for &id in &ids {
+                    let p = tr.get_proof(id).unwrap();
+                    assert!(p.verify(&tr.root));
+                }
+                for &id in &ids {
+                    let p = tr.get_proof(id).unwrap();
+                    assert!(p.verify(&tr.root));
+                }
+            }
+            {
+                let mut td = PartialMerkleTrie::new();
+                td.insert_or_replace(k_1, v_1);
+                assert!(td.get_proof(&k_1).unwrap().verify(&td.root));
+                td.insert_or_replace(k_2, v_2);
+                assert!(td.get_proof(&k_2).unwrap().verify(&td.root));
+                td.insert_or_replace(k_3, v_3);
+                assert!(td.get_proof(&k_3).unwrap().verify(&td.root));
+            }
+        }
+
+        // get
+        {
+            {
+                let items: Vec<(ID, Hash)> = vec![
+                    (k_1, v_1), (k_2, v_2), (k_3, v_3), (k_32, v_32), (k_64, v_64), (k_85, v_85),
+                    (k_128, v_128), (k_130, v_130), (k_200, v_200), (k_254, v_254), (k_255, v_255),
+                ];
+                for (id, vh) in &items {
+                    assert_eq!(tr.get(id).unwrap(), *vh);
+                }
+                for (id, vh) in &items {
+                    assert_eq!(tr.get(id).unwrap(), *vh);
+                }
+            }
+            {
+                let mut td = PartialMerkleTrie::new();
+                td.insert_or_replace(k_1, v_1);
+                assert_eq!(td.get(&k_1).unwrap(), v_1);
+                td.insert_or_replace(k_2, v_2);
+                assert_eq!(td.get(&k_2).unwrap(), v_2);
+                td.insert_or_replace(k_3, v_3);
+                assert_eq!(td.get(&k_3).unwrap(), v_3);
             }
         }
     }
