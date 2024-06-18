@@ -379,7 +379,9 @@ impl PartialMerkleTrie {
                         match &i.l {
                             Child::Leaf(_) => {}
                             Child::SubRoot(_) => {
-                                return false;
+                                if n == 2 {
+                                    return false;
+                                }
                             }
                         }
                         match &i.r {
@@ -482,24 +484,25 @@ impl PartialMerkleTrie {
                 self.inner_store.insert(self.root, node);
             }
             _ => {
-                let new_root = self.insert_or_replace_rec(a_id, a_hash, self.root, self.root_dirty);
+                let (new_root, change_to_dirty) = self.insert_or_replace_rec(a_id, a_hash, self.root, self.root_dirty);
                 if new_root.is_some() {
                     self.root = new_root.unwrap();
-                } else {
-                    // println!("need update        {:?}", a_id);
+                }
+                // println!("need update        {:?}", a_id);
+                if change_to_dirty {
                     self.root_dirty = true;
                 }
             }
         }
     }
 
-    fn insert_or_replace_rec(&mut self, a_id: ID, a_hash: Hash, cur_node_id: NodeIDHash, is_root_and_dirty: bool) -> Option<NodeIDHash> {
+    fn insert_or_replace_rec(&mut self, a_id: ID, a_hash: Hash, cur_node_id: NodeIDHash, current_dirty: bool) -> (Option<NodeIDHash>, bool) {
         let current = self.inner_store.get_mut(&cur_node_id).expect("node not exist");
         let (cp_len, a_is_left) = common_prefix_len(&a_id, &current.r_id);
         let next_step = match cp_len {
             n if n < current.cp_len => {
                 let mut new_node = Inner::new(a_id, a_hash, current.r_id, Child::SubRoot(cur_node_id));
-                if current.l_dirty || current.r_dirty || is_root_and_dirty { // child dirty
+                if current.l_dirty || current.r_dirty || current_dirty { // child dirty
                     if a_is_left {
                         new_node.r_dirty = true;
                     } else {
@@ -510,7 +513,7 @@ impl PartialMerkleTrie {
                 // println!("up insert new node {:?}", new_hash);
                 self.inner_store.insert(new_hash, new_node);
                 self.leaf_count += 1;
-                return Some(new_hash);
+                return (Some(new_hash), false);
             }
             n if n == current.cp_len && a_is_left => {
                 match &mut current.l {
@@ -528,8 +531,8 @@ impl PartialMerkleTrie {
                         None
                     }
                     Child::SubRoot(sr) => {
-                        current.l_dirty = true;
-                        Some((*sr, true))
+                        //current.l_dirty = true;
+                        Some((*sr, true, current.l_dirty))
                     }
                 }
             }
@@ -549,33 +552,37 @@ impl PartialMerkleTrie {
                         None
                     }
                     Child::SubRoot(sr) => {
-                        current.r_dirty = true;
-                        Some((*sr, false))
+                        //current.r_dirty = true;
+                        Some((*sr, false, current.r_dirty))
                     }
                 }
             }
         };
 
         if next_step.is_some() {
-            let (next_hash, go_left) = next_step.unwrap();
-            let update = self.insert_or_replace_rec(a_id, a_hash, next_hash, false);
-            if update.is_some() {
+            let (next_hash, go_left, next_is_dirty) = next_step.unwrap();
+            let (update, change_to_dirty) = self.insert_or_replace_rec(a_id, a_hash, next_hash, next_is_dirty);
+            if update.is_some() || change_to_dirty {
                 let current = self.inner_store.get_mut(&cur_node_id).expect("node not exist");
-                let to_reset = if go_left { &mut current.l_dirty } else { &mut current.r_dirty };
-                assert!(*to_reset);
-                *to_reset = false;
 
-                let kid = if go_left { &mut current.l } else { &mut current.r };
-                match kid {
-                    Child::Leaf(_) => { panic!("wrong child type") }
-                    Child::SubRoot(sr) => {
-                        *sr = update.unwrap();
+                if update.is_some() {
+                    let kid = if go_left { &mut current.l } else { &mut current.r };
+                    match kid {
+                        Child::Leaf(_) => { panic!("wrong child type") }
+                        Child::SubRoot(sr) => {
+                            *sr = update.unwrap();
+                        }
                     }
+                }
+
+                if change_to_dirty {
+                    let to_set = if go_left { &mut current.l_dirty } else { &mut current.r_dirty };
+                    *to_set = true;
                 }
             }
         }
 
-        None
+        (None, true)
     }
 }
 
@@ -765,6 +772,11 @@ mod tests {
 
         // partial trie
         {
+            let mut tp = PartialMerkleTrie::new();
+            assert!(tp.verify_partial());
+            tp.insert_or_replace(k_255, temp);
+            assert!(tp.verify_partial());
+
             let ids = vec![&k_1, &k_2, &k_3, &k_64, &k_128, &k_254, &k_255];
             let tp = tr.get_partial(&ids);
             assert_eq!(tp.inner_store.len(), 6);
@@ -863,5 +875,89 @@ mod tests {
                 assert_eq!(td.get(&k_3).unwrap(), v_3);
             }
         }
+    }
+
+    #[test]
+    fn larger_trie_works() {
+        let mut items = vec![];
+        for i in 1..255 {
+            items.push(create_key_value(i));
+        }
+        let mut tree = PartialMerkleTrie::new();
+        tree.insert_or_replace_batch(items);
+        assert!(tree.verify_partial());
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+    // use partial_binary_merkle::{ID, PartialMerkleTrie};
+    use rand::prelude::ThreadRng;
+    use rand::Rng;
+    // use crate::common::*;
+
+    pub struct FakeRandom {
+        rng: ThreadRng,
+    }
+
+    impl FakeRandom {
+        pub fn new() -> FakeRandom {
+            FakeRandom { rng: rand::thread_rng() }
+        }
+
+        pub fn random_hash(&mut self) -> Hash {
+            self.rng.gen()
+        }
+
+        pub fn random_hashes(&mut self, n: usize) -> Vec<Hash> {
+            (0..n).map(|_| self.random_hash()).collect()
+        }
+    }
+
+    pub struct Input {
+        pub trie: PartialMerkleTrie,
+        pub kv: Vec<(ID, Hash)>,
+    }
+
+    impl Input {
+        pub fn new(init_size: usize, n_additions: usize) -> Input {
+            let mut fr = FakeRandom::new();
+            let trie = {
+                let keys = fr.random_hashes(init_size);
+                let leaves = fr.random_hashes(init_size);
+                let items: Vec<(ID, Hash)> = keys.into_iter().zip(leaves).collect();
+                let mut tree = PartialMerkleTrie::new();
+                tree.insert_or_replace_batch(items);
+                tree
+            };
+
+            let kv: Vec<(ID, Hash)> = {
+                let keys = fr.random_hashes(n_additions);
+                let leaves = fr.random_hashes(n_additions);
+                keys.into_iter().zip(leaves).collect()
+            };
+
+            Input { trie, kv }
+        }
+
+        pub fn process(&mut self) -> Option<Hash> {
+            if self.trie.verify_partial() {
+                //let mut temp: Vec<(ID, Hash)> = vec![];
+                self.trie.insert_or_replace_batch(self.kv.drain(..).collect());
+                Some(self.trie.root)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn process_works() {
+        let init_size = 10_000usize;
+        let n_additions = 10_000usize;
+        let mut input = Input::new(init_size, n_additions);
+        let x = input.process();
+        assert!(x.is_some());
     }
 }
