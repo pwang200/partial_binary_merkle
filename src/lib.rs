@@ -60,6 +60,7 @@ pub fn common_prefix_len(a: &ID, b: &ID) -> (u16, bool) {
     (cpl, a_is_left)
 }
 
+#[repr(align(4))]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Inner {
     r_id: ID,
@@ -125,6 +126,7 @@ impl Proof {
     }
 }
 
+#[repr(align(4))]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PartialMerkleTrie {
     pub root: Hash,
