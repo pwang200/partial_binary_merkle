@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use sha2::{Sha256, Digest};
 use serde::{Deserialize, Serialize};
 
@@ -133,7 +133,7 @@ pub struct PartialMerkleTrie {
     pub root_dirty: bool,
     pub leaf_count: usize,
     //try BTreeMap
-    pub inner_store: HashMap<Hash, Inner>,
+    pub inner_store: BTreeMap<Hash, Inner>,
 }
 
 impl PartialMerkleTrie {
@@ -142,7 +142,7 @@ impl PartialMerkleTrie {
             root: Hash::default(),
             root_dirty: false,
             leaf_count: 0,
-            inner_store: HashMap::new(),
+            inner_store: BTreeMap::new(),
         }
     }
 
