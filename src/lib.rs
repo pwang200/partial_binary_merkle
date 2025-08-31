@@ -1,29 +1,59 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
+use std::hash::Hash as StdHash;
 use serde::{Deserialize, Serialize};
 
 pub const HASH_LEN: usize = 32;
 pub const HASH_LEN_BITS: u16 = HASH_LEN as u16 * 8;
 
 pub type Hash = [u8; HASH_LEN];
-pub type ID = Hash;
 pub type ValueHash = Hash;
 pub type NodeIDHash = Hash;
 
 pub type ResultT<T> = Result<T, &'static str>;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Leaf {
-    id: ID,
+pub trait KeyType: Copy + Clone + Debug + PartialEq + Eq + StdHash + Serialize + for<'de> Deserialize<'de> + AsRef<[u8]> + Default {
+    const LEN: usize;
+    const LEN_BITS: u16 = Self::LEN as u16 * 8;
+}
+
+impl KeyType for [u8; 8] {
+    const LEN: usize = 8;
+}
+
+impl KeyType for [u8; 16] {
+    const LEN: usize = 16;
+}
+
+impl KeyType for [u8; 32] {
+    const LEN: usize = 32;
+}
+
+// Default key type for backward compatibility
+pub type DefaultKey = [u8; 32];
+
+// Type aliases for common key sizes
+pub type PartialMerkleTrie8 = PartialMerkleTrie<[u8; 8]>;
+pub type PartialMerkleTrie16 = PartialMerkleTrie<[u8; 16]>;
+pub type PartialMerkleTrie32 = PartialMerkleTrie<[u8; 32]>;
+
+#[derive(Serialize, Debug, Clone)]
+#[derive(Deserialize)]
+#[serde(bound = "K: KeyType")]
+pub struct Leaf<K: KeyType> {
+    id: K,
     hash: ValueHash,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum Child {
-    Leaf(Leaf),
+#[derive(Serialize, Debug, Clone)]
+#[derive(Deserialize)]
+#[serde(bound = "K: KeyType")]
+pub enum Child<K: KeyType> {
+    Leaf(Leaf<K>),
     SubRoot(NodeIDHash),
 }
 
-impl Child {
+impl<K: KeyType> Child<K> {
     pub fn get_hash(&self) -> Hash {
         match &self {
             Child::Leaf(leaf) => { leaf.hash }
@@ -32,20 +62,25 @@ impl Child {
     }
 }
 
-// also return if a is the left
-pub fn common_prefix_len(a: &ID, b: &ID) -> (u16, bool) {
-    let cp_bytes = a.iter().zip(b).take_while(|(&x, &y)| x == y).count();
+// also return if a is the left  
+pub fn common_prefix_len<K>(a: &K, b: &K) -> (u16, bool) 
+where
+    K: KeyType,
+{
+    let a_bytes = a.as_ref();
+    let b_bytes = b.as_ref();
+    let cp_bytes = a_bytes.iter().zip(b_bytes).take_while(|(&x, &y)| x == y).count();
     let mut cpl = 8u16 * (cp_bytes as u16);
     let mut a_is_left = true;
-    if cpl == 256u16 {
+    if cpl == K::LEN_BITS {
         return (cpl, a_is_left);
     }
 
-    let a = a[cp_bytes];
-    let b = b[cp_bytes];
+    let a = a_bytes[cp_bytes];
+    let b = b_bytes[cp_bytes];
     //println!("common_prefix_len: {:b}, {:b}", a, b);
     let mut mask = 1u8 << 7;
-    for _ in 0usize..HASH_LEN {
+    for _ in 0usize..8 {
         let a_bit = a & mask;
         let b_bit = b & mask;
         if a_bit == b_bit {
@@ -53,30 +88,33 @@ pub fn common_prefix_len(a: &ID, b: &ID) -> (u16, bool) {
             mask = mask >> 1;
         } else {
             a_is_left = a_bit == 0;
+            break;
         }
     }
     (cpl, a_is_left)
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Inner {
-    r_id: ID,
+#[derive(Serialize, Debug, Clone)]
+#[derive(Deserialize)]
+#[serde(bound = "K: KeyType")]
+pub struct Inner<K: KeyType> {
+    r_id: K,
     cp_len: u16,
     l_dirty: bool,
     r_dirty: bool,
-    l: Child,
-    r: Child,
+    l: Child<K>,
+    r: Child<K>,
 }
 
-impl Inner {
-    pub fn new_one(a_id: ID, a: ValueHash) -> Inner {
-        let b_id = ID::default();
+impl<K: KeyType> Inner<K> {
+    pub fn new_one(a_id: K, a: ValueHash) -> Inner<K> {
+        let b_id = K::default();
         let b = Child::SubRoot(NodeIDHash::default());
         Self::new(a_id, a, b_id, b)
     }
 
-    pub fn new(a_id: ID, a: ValueHash, b_id: ID, b: Child) -> Inner {
-        let a = Child::Leaf(Leaf { id: a_id, hash: a });
+    pub fn new(a_id: K, a: ValueHash, b_id: K, b: Child<K>) -> Inner<K> {
+        let a = Child::Leaf(Leaf { id: a_id.clone(), hash: a });
         let (cp_len, a_is_left) = common_prefix_len(&a_id, &b_id);
         let (l, r) = if a_is_left { (a, b) } else { (b, a) };
         Inner {
@@ -123,17 +161,19 @@ impl Proof {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PartialMerkleTrie {
+#[derive(Serialize, Debug, Clone)]
+#[derive(Deserialize)]
+#[serde(bound = "K: KeyType")]
+pub struct PartialMerkleTrie<K: KeyType = DefaultKey> {
     pub root: Hash,
     pub root_dirty: bool,
     pub leaf_count: usize,
     //try BTreeMap
-    pub inner_store: HashMap<Hash, Inner>,
+    pub inner_store: HashMap<Hash, Inner<K>>,
 }
 
-impl PartialMerkleTrie {
-    pub fn new() -> PartialMerkleTrie {
+impl<K: KeyType> PartialMerkleTrie<K> {
+    pub fn new() -> PartialMerkleTrie<K> {
         PartialMerkleTrie {
             root: Hash::default(),
             root_dirty: false,
@@ -176,7 +216,7 @@ impl PartialMerkleTrie {
         self.root_dirty = false;
     }
 
-    pub fn get(&self, id: &ID) -> Option<ValueHash> {
+    pub fn get(&self, id: &K) -> Option<ValueHash> {
         match self.leaf_count
         {
             n if n == 0 => {}
@@ -195,7 +235,7 @@ impl PartialMerkleTrie {
                 let mut cur_node_id = &self.root;
                 loop {
                     let current = self.inner_store.get(cur_node_id).expect("node not exist");
-                    let (cp_len, a_is_left) = common_prefix_len(&id, &current.r_id);
+                    let (cp_len, a_is_left) = common_prefix_len(id, &current.r_id);
                     match cp_len {
                         n if n < current.cp_len => {
                             break;
@@ -233,7 +273,7 @@ impl PartialMerkleTrie {
         None
     }
 
-    pub fn get_proof(&self, id: &ID) -> Option<Proof> {
+    pub fn get_proof(&self, id: &K) -> Option<Proof> {
         match self.leaf_count
         {
             n if n == 0 => {}
@@ -257,7 +297,7 @@ impl PartialMerkleTrie {
                 let mut path = vec![];
                 loop {
                     let current = self.inner_store.get(cur_node_id).expect("node not exist");
-                    let (cp_len, a_is_left) = common_prefix_len(&id, &current.r_id);
+                    let (cp_len, a_is_left) = common_prefix_len(id, &current.r_id);
                     match cp_len {
                         n if n < current.cp_len => {
                             break;
@@ -305,7 +345,7 @@ impl PartialMerkleTrie {
         return None;
     }
 
-    pub fn get_partial(&self, ids: &Vec<&ID>) -> PartialMerkleTrie {
+    pub fn get_partial(&self, ids: &Vec<&K>) -> PartialMerkleTrie<K> {
         assert!(!self.root_dirty);
         let mut partial = PartialMerkleTrie {
             root: self.root,
@@ -330,7 +370,7 @@ impl PartialMerkleTrie {
                     partial.inner_store.get(cur_node_id).unwrap()
                 };
 
-                let (cp_len, a_is_left) = common_prefix_len(&id, &current.r_id);
+                let (cp_len, a_is_left) = common_prefix_len(id, &current.r_id);
                 match cp_len {
                     n if n < current.cp_len => {
                         break;
@@ -439,14 +479,14 @@ impl PartialMerkleTrie {
         }
     }
 
-    pub fn insert_or_replace(&mut self, a_id: ID, a_hash: Hash) {
+    pub fn insert_or_replace(&mut self, a_id: K, a_hash: Hash) {
         self.insert_or_replace_internal(a_id, a_hash);
         if self.root_dirty {
             self.update_root();
         }
     }
 
-    pub fn insert_or_replace_batch(&mut self, items: Vec<(ID, Hash)>) {
+    pub fn insert_or_replace_batch(&mut self, items: Vec<(K, Hash)>) {
         for (a_id, a_hash) in items {
             // println!("bt insert new pair {:?} {:?}", a_id, a_hash);
             self.insert_or_replace_internal(a_id, a_hash);
@@ -459,7 +499,7 @@ impl PartialMerkleTrie {
         }
     }
 
-    pub fn remove(&mut self, id: &ID) -> bool {
+    pub fn remove(&mut self, id: &K) -> bool {
         let removed = self.remove_internal(id);
         if self.root_dirty {
             self.update_root();
@@ -467,7 +507,7 @@ impl PartialMerkleTrie {
         removed
     }
 
-    pub fn remove_batch(&mut self, ids: Vec<&ID>) -> usize {
+    pub fn remove_batch(&mut self, ids: Vec<&K>) -> usize {
         let mut removed_count = 0;
         for id in ids {
             if self.remove_internal(id) {
@@ -480,7 +520,7 @@ impl PartialMerkleTrie {
         removed_count
     }
 
-    pub fn insert_or_replace_internal(&mut self, a_id: ID, a_hash: Hash) {
+    pub fn insert_or_replace_internal(&mut self, a_id: K, a_hash: Hash) {
         match self.leaf_count {
             n if n == 0 => {
                 let node = Inner::new_one(a_id, a_hash);
@@ -515,7 +555,7 @@ impl PartialMerkleTrie {
         }
     }
 
-    fn insert_or_replace_rec(&mut self, a_id: ID, a_hash: Hash, cur_node_id: NodeIDHash, current_dirty: bool) -> (Option<NodeIDHash>, bool) {
+    fn insert_or_replace_rec(&mut self, a_id: K, a_hash: Hash, cur_node_id: NodeIDHash, current_dirty: bool) -> (Option<NodeIDHash>, bool) {
         let current = self.inner_store.get_mut(&cur_node_id).expect("node not exist");
         let (cp_len, a_is_left) = common_prefix_len(&a_id, &current.r_id);
         let next_step = match cp_len {
@@ -604,7 +644,7 @@ impl PartialMerkleTrie {
         (None, true)
     }
 
-    pub fn remove_internal(&mut self, id: &ID) -> bool {
+    pub fn remove_internal(&mut self, id: &K) -> bool {
         let leaf_count = self.leaf_count;
         let root_hash = self.root;
         
@@ -672,7 +712,7 @@ impl PartialMerkleTrie {
         }
     }
 
-    fn remove_rec(&mut self, id: &ID, cur_node_id: &NodeIDHash) -> (bool, Option<NodeIDHash>) {
+    fn remove_rec(&mut self, id: &K, cur_node_id: &NodeIDHash) -> (bool, Option<NodeIDHash>) {
         let (cp_len, r_id, l_child, r_child) = {
             let current = self.inner_store.get(cur_node_id).expect("node not exist");
             (current.cp_len, current.r_id, current.l.clone(), current.r.clone())
@@ -814,7 +854,7 @@ impl PartialMerkleTrie {
 mod tests {
     use super::*;
 
-    fn create_key_value(first_byte: u8) -> (ID, Hash) {
+    fn create_key_value(first_byte: u8) -> (DefaultKey, Hash) {
         let mut id = Hash::default();
         id[0] = first_byte;
         let mut vh = Hash::default();
@@ -966,7 +1006,7 @@ mod tests {
         // batch inserts
         {
             {
-                let items: Vec<(ID, Hash)> = vec![
+                let items: Vec<(DefaultKey, Hash)> = vec![
                     (k_1, v_1), (k_2, v_2), (k_3, v_3), (k_64, v_64),
                     (k_128, v_128), (k_254, v_254), (k_255, v_255),
                 ];
@@ -980,7 +1020,7 @@ mod tests {
             }
 
             {
-                let items: Vec<(ID, Hash)> = vec![
+                let items: Vec<(DefaultKey, Hash)> = vec![
                     (k_255, v_255), (k_254, v_254), (k_128, v_128),
                     (k_64, v_64), (k_3, v_3), (k_2, v_2), (k_1, v_1),
                 ];
@@ -1131,7 +1171,7 @@ mod tests {
         // get
         {
             {
-                let items: Vec<(ID, Hash)> = vec![
+                let items: Vec<(DefaultKey, Hash)> = vec![
                     (k_1, v_1), (k_2, v_2), (k_3, v_3), (k_32, v_32), (k_64, v_64), (k_85, v_85),
                     (k_128, v_128), (k_130, v_130), (k_200, v_200), (k_254, v_254), (k_255, v_255),
                 ];
@@ -1165,6 +1205,91 @@ mod tests {
         assert!(tree.verify_partial());
     }
 
+
+    #[test]
+    fn test_with_8_byte_keys() {
+        type Key8 = [u8; 8];
+        let mut tree = PartialMerkleTrie::<Key8>::new();
+        
+        // Create some 8-byte keys
+        let key1: Key8 = [1, 2, 3, 4, 5, 6, 7, 8];
+        let key2: Key8 = [1, 2, 3, 4, 9, 10, 11, 12];
+        let key3: Key8 = [255, 254, 253, 252, 251, 250, 249, 248];
+        
+        // Create some hash values
+        let hash1: Hash = [1; 32];
+        let hash2: Hash = [2; 32];
+        let hash3: Hash = [3; 32];
+        
+        // Test insertion
+        tree.insert_or_replace(key1, hash1);
+        tree.insert_or_replace(key2, hash2);
+        tree.insert_or_replace(key3, hash3);
+        
+        assert_eq!(tree.leaf_count, 3);
+        assert!(tree.verify_partial());
+        
+        // Test retrieval
+        assert_eq!(tree.get(&key1).unwrap(), hash1);
+        assert_eq!(tree.get(&key2).unwrap(), hash2);
+        assert_eq!(tree.get(&key3).unwrap(), hash3);
+        
+        // Test non-existent key
+        let key_not_exist: Key8 = [100; 8];
+        assert!(tree.get(&key_not_exist).is_none());
+        
+        // Test proof generation and verification
+        let proof1 = tree.get_proof(&key1).unwrap();
+        assert!(proof1.verify(&tree.root));
+        
+        let proof2 = tree.get_proof(&key2).unwrap();
+        assert!(proof2.verify(&tree.root));
+        
+        // Test removal
+        assert!(tree.remove(&key2));
+        assert_eq!(tree.leaf_count, 2);
+        assert!(tree.get(&key2).is_none());
+        assert!(tree.get(&key1).is_some());
+        assert!(tree.get(&key3).is_some());
+        
+        // Test batch operations
+        let key4: Key8 = [4; 8];
+        let key5: Key8 = [5; 8];
+        let hash4: Hash = [4; 32];
+        let hash5: Hash = [5; 32];
+        
+        tree.insert_or_replace_batch(vec![(key4, hash4), (key5, hash5)]);
+        assert_eq!(tree.leaf_count, 4);
+        
+        let removed = tree.remove_batch(vec![&key1, &key3]);
+        assert_eq!(removed, 2);
+        assert_eq!(tree.leaf_count, 2);
+        assert!(tree.get(&key4).is_some());
+        assert!(tree.get(&key5).is_some());
+    }
+
+    #[test]
+    fn test_with_16_byte_keys() {
+        type Key16 = [u8; 16];
+        let mut tree = PartialMerkleTrie::<Key16>::new();
+        
+        let key1: Key16 = [1; 16];
+        let key2: Key16 = [2; 16];
+        let hash1: Hash = [10; 32];
+        let hash2: Hash = [20; 32];
+        
+        tree.insert_or_replace(key1, hash1);
+        tree.insert_or_replace(key2, hash2);
+        
+        assert_eq!(tree.leaf_count, 2);
+        assert_eq!(tree.get(&key1).unwrap(), hash1);
+        assert_eq!(tree.get(&key2).unwrap(), hash2);
+        
+        // Test that we can create partial tries with 16-byte keys
+        let partial = tree.get_partial(&vec![&key1]);
+        assert_eq!(partial.leaf_count, 2);
+        assert!(partial.verify_partial());
+    }
 
     #[test]
     fn remove_basic_tests() {
@@ -1286,7 +1411,7 @@ mod more_tests {
 
     pub struct Input {
         pub trie: PartialMerkleTrie,
-        pub kv: Vec<(ID, Hash)>,
+        pub kv: Vec<(DefaultKey, Hash)>,
     }
 
     impl Input {
@@ -1295,13 +1420,13 @@ mod more_tests {
             let trie = {
                 let keys = fr.random_hashes(init_size);
                 let leaves = fr.random_hashes(init_size);
-                let items: Vec<(ID, Hash)> = keys.into_iter().zip(leaves).collect();
+                let items: Vec<(DefaultKey, Hash)> = keys.into_iter().zip(leaves).collect();
                 let mut tree = PartialMerkleTrie::new();
                 tree.insert_or_replace_batch(items);
                 tree
             };
 
-            let kv: Vec<(ID, Hash)> = {
+            let kv: Vec<(DefaultKey, Hash)> = {
                 let keys = fr.random_hashes(n_additions);
                 let leaves = fr.random_hashes(n_additions);
                 keys.into_iter().zip(leaves).collect()
@@ -1312,7 +1437,7 @@ mod more_tests {
 
         pub fn process(&mut self) -> Option<Hash> {
             if self.trie.verify_partial() {
-                //let mut temp: Vec<(ID, Hash)> = vec![];
+                //let mut temp: Vec<(DefaultKey, Hash)> = vec![];
                 self.trie.insert_or_replace_batch(self.kv.drain(..).collect());
                 Some(self.trie.root)
             } else {
