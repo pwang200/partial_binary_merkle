@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use sha2::{Sha256, Digest};
 use serde::{Deserialize, Serialize};
 
 pub const HASH_LEN: usize = 32;
@@ -10,7 +9,6 @@ pub type ID = Hash;
 pub type ValueHash = Hash;
 pub type NodeIDHash = Hash;
 
-pub type DefaultHasher = Sha256;
 pub type ResultT<T> = Result<T, &'static str>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -92,10 +90,10 @@ impl Inner {
     }
 
     pub fn hash(&self) -> Hash {
-        let mut hasher = DefaultHasher::new();
-        hasher.update(self.l.get_hash());
-        hasher.update(self.r.get_hash());
-        hasher.finalize().as_slice().try_into().expect("Hash")
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.l.get_hash());
+        hasher.update(&self.r.get_hash());
+        hasher.finalize().into()
     }
 }
 //
@@ -115,11 +113,11 @@ pub struct Proof {
 impl Proof {
     pub fn verify(&self, root: &Hash) -> bool {
         let r = self.path.iter().rev().fold(self.v_hash, |round_hash, (left, ph)| {
-            let mut hasher = DefaultHasher::new();
+            let mut hasher = blake3::Hasher::new();
             let (a, b) = if *left { (ph, &round_hash) } else { (&round_hash, ph) };
             hasher.update(a);
             hasher.update(b);
-            hasher.finalize().as_slice().try_into().expect("Hash")
+            hasher.finalize().into()
         });
         r == *root
     }
@@ -461,6 +459,27 @@ impl PartialMerkleTrie {
         }
     }
 
+    pub fn remove(&mut self, id: &ID) -> bool {
+        let removed = self.remove_internal(id);
+        if self.root_dirty {
+            self.update_root();
+        }
+        removed
+    }
+
+    pub fn remove_batch(&mut self, ids: Vec<&ID>) -> usize {
+        let mut removed_count = 0;
+        for id in ids {
+            if self.remove_internal(id) {
+                removed_count += 1;
+            }
+        }
+        if self.root_dirty {
+            self.update_root();
+        }
+        removed_count
+    }
+
     pub fn insert_or_replace_internal(&mut self, a_id: ID, a_hash: Hash) {
         match self.leaf_count {
             n if n == 0 => {
@@ -584,6 +603,211 @@ impl PartialMerkleTrie {
 
         (None, true)
     }
+
+    pub fn remove_internal(&mut self, id: &ID) -> bool {
+        let leaf_count = self.leaf_count;
+        let root_hash = self.root;
+        
+        match leaf_count {
+            0 => false,
+            1 => {
+                if let Some(node) = self.inner_store.get(&root_hash) {
+                    match &node.r {
+                        Child::Leaf(leaf) => {
+                            if leaf.id == *id {
+                                self.inner_store.clear();
+                                self.root = Hash::default();
+                                self.leaf_count = 0;
+                                self.root_dirty = false;
+                                return true;
+                            }
+                        }
+                        Child::SubRoot(_) => panic!("subtree should not exist")
+                    }
+                }
+                false
+            }
+            2 => {
+                if let Some(node) = self.inner_store.remove(&root_hash) {
+                    let (_, remaining_child) = match (&node.l, &node.r) {
+                        (Child::Leaf(l_leaf), Child::Leaf(r_leaf)) => {
+                            if l_leaf.id == *id {
+                                (true, node.r.clone())
+                            } else if r_leaf.id == *id {
+                                (false, node.l.clone())
+                            } else {
+                                self.inner_store.insert(root_hash, node);
+                                return false;
+                            }
+                        }
+                        _ => panic!("with 2 leaves, both children should be leaves")
+                    };
+                    
+                    if let Child::Leaf(remaining_leaf) = remaining_child {
+                        let new_node = Inner::new_one(remaining_leaf.id, remaining_leaf.hash);
+                        self.root = new_node.hash();
+                        self.inner_store.insert(self.root, new_node);
+                        self.leaf_count = 1;
+                        self.root_dirty = false;
+                        true
+                    } else {
+                        panic!("remaining child should be a leaf")
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => {
+                let (removed, new_root) = self.remove_rec(id, &root_hash);
+                if removed {
+                    self.leaf_count -= 1;
+                    if let Some(new_root_hash) = new_root {
+                        self.root = new_root_hash;
+                    } else {
+                        self.root_dirty = true;
+                    }
+                }
+                removed
+            }
+        }
+    }
+
+    fn remove_rec(&mut self, id: &ID, cur_node_id: &NodeIDHash) -> (bool, Option<NodeIDHash>) {
+        let (cp_len, r_id, l_child, r_child) = {
+            let current = self.inner_store.get(cur_node_id).expect("node not exist");
+            (current.cp_len, current.r_id, current.l.clone(), current.r.clone())
+        };
+        let (cp_len_computed, a_is_left) = common_prefix_len(id, &r_id);
+        
+        match cp_len_computed {
+            n if n < cp_len => (false, None),
+            n if n == cp_len && a_is_left => {
+                match l_child {
+                    Child::Leaf(leaf) => {
+                        if leaf.id == *id {
+                            self.inner_store.remove(cur_node_id);
+                            match r_child {
+                                Child::Leaf(rl) => {
+                                    let new_node = Inner::new_one(rl.id, rl.hash);
+                                    let new_hash = new_node.hash();
+                                    self.inner_store.insert(new_hash, new_node);
+                                    (true, Some(new_hash))
+                                }
+                                Child::SubRoot(sr) => {
+                                    if sr == Hash::default() {
+                                        (true, Some(Hash::default()))
+                                    } else {
+                                        (true, Some(sr))
+                                    }
+                                }
+                            }
+                        } else {
+                            (false, None)
+                        }
+                    }
+                    Child::SubRoot(sr) => {
+                        let (removed, new_child) = self.remove_rec(id, &sr);
+                        if removed {
+                            if let Some(new_sr) = new_child {
+                                if new_sr == Hash::default() {
+                                    self.inner_store.remove(cur_node_id);
+                                    match r_child {
+                                        Child::Leaf(rl) => {
+                                            let new_node = Inner::new_one(rl.id, rl.hash);
+                                            let new_hash = new_node.hash();
+                                            self.inner_store.insert(new_hash, new_node);
+                                            (true, Some(new_hash))
+                                        }
+                                        Child::SubRoot(rsr) => {
+                                            if rsr == Hash::default() {
+                                                (true, Some(Hash::default()))
+                                            } else {
+                                                (true, Some(rsr))
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let current = self.inner_store.get_mut(cur_node_id).unwrap();
+                                    current.l = Child::SubRoot(new_sr);
+                                    current.l_dirty = false;
+                                    (true, None)
+                                }
+                            } else {
+                                let current = self.inner_store.get_mut(cur_node_id).unwrap();
+                                current.l_dirty = true;
+                                (true, None)
+                            }
+                        } else {
+                            (false, None)
+                        }
+                    }
+                }
+            }
+            _ => {
+                match r_child {
+                    Child::Leaf(leaf) => {
+                        if leaf.id == *id {
+                            self.inner_store.remove(cur_node_id);
+                            match l_child {
+                                Child::Leaf(ll) => {
+                                    let new_node = Inner::new_one(ll.id, ll.hash);
+                                    let new_hash = new_node.hash();
+                                    self.inner_store.insert(new_hash, new_node);
+                                    (true, Some(new_hash))
+                                }
+                                Child::SubRoot(sr) => {
+                                    if sr == Hash::default() {
+                                        (true, Some(Hash::default()))
+                                    } else {
+                                        (true, Some(sr))
+                                    }
+                                }
+                            }
+                        } else {
+                            (false, None)
+                        }
+                    }
+                    Child::SubRoot(sr) => {
+                        let (removed, new_child) = self.remove_rec(id, &sr);
+                        if removed {
+                            if let Some(new_sr) = new_child {
+                                if new_sr == Hash::default() {
+                                    self.inner_store.remove(cur_node_id);
+                                    match l_child {
+                                        Child::Leaf(ll) => {
+                                            let new_node = Inner::new_one(ll.id, ll.hash);
+                                            let new_hash = new_node.hash();
+                                            self.inner_store.insert(new_hash, new_node);
+                                            (true, Some(new_hash))
+                                        }
+                                        Child::SubRoot(lsr) => {
+                                            if lsr == Hash::default() {
+                                                (true, Some(Hash::default()))
+                                            } else {
+                                                (true, Some(lsr))
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let current = self.inner_store.get_mut(cur_node_id).unwrap();
+                                    current.r = Child::SubRoot(new_sr);
+                                    current.r_dirty = false;
+                                    (true, None)
+                                }
+                            } else {
+                                let current = self.inner_store.get_mut(cur_node_id).unwrap();
+                                current.r_dirty = true;
+                                (true, None)
+                            }
+                        } else {
+                            (false, None)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -851,6 +1075,59 @@ mod tests {
             }
         }
 
+        // remove operations
+        {
+            let mut test_tree = tr.clone();
+            
+            // Test removing single element
+            assert!(test_tree.remove(&k_1));
+            assert_eq!(test_tree.leaf_count, 10);
+            assert!(test_tree.get(&k_1).is_none());
+            assert!(test_tree.get(&k_2).is_some());
+            
+            // Test removing non-existent element
+            assert!(!test_tree.remove(&Hash::default()));
+            assert_eq!(test_tree.leaf_count, 10);
+            
+            // Test batch remove
+            let ids_to_remove = vec![&k_2, &k_3, &k_32];
+            let removed_count = test_tree.remove_batch(ids_to_remove);
+            assert_eq!(removed_count, 3);
+            assert_eq!(test_tree.leaf_count, 7);
+            assert!(test_tree.get(&k_2).is_none());
+            assert!(test_tree.get(&k_3).is_none());
+            assert!(test_tree.get(&k_32).is_none());
+            
+            // Test removing down to single element
+            let remaining_ids = vec![&k_64, &k_85, &k_128, &k_130, &k_200, &k_254];
+            test_tree.remove_batch(remaining_ids);
+            assert_eq!(test_tree.leaf_count, 1);
+            assert!(test_tree.get(&k_255).is_some());
+            
+            // Test removing last element
+            assert!(test_tree.remove(&k_255));
+            assert_eq!(test_tree.leaf_count, 0);
+            assert_eq!(test_tree.root, Hash::default());
+            assert!(test_tree.inner_store.is_empty());
+        }
+
+        // remove from small trees
+        {
+            let mut td = PartialMerkleTrie::new();
+            td.insert_or_replace(k_1, v_1);
+            assert!(td.remove(&k_1));
+            assert_eq!(td.leaf_count, 0);
+            assert_eq!(td.root, Hash::default());
+            
+            td.insert_or_replace(k_1, v_1);
+            td.insert_or_replace(k_2, v_2);
+            assert_eq!(td.leaf_count, 2);
+            assert!(td.remove(&k_1));
+            assert_eq!(td.leaf_count, 1);
+            assert!(td.get(&k_2).is_some());
+            assert!(td.get(&k_1).is_none());
+        }
+
         // get
         {
             {
@@ -886,6 +1163,98 @@ mod tests {
         let mut tree = PartialMerkleTrie::new();
         tree.insert_or_replace_batch(items);
         assert!(tree.verify_partial());
+    }
+
+
+    #[test]
+    fn remove_basic_tests() {
+        // Edge cases - empty tree
+        {
+            let mut empty_tree = PartialMerkleTrie::new();
+            let (k_1, _) = create_key_value(1);
+            assert!(!empty_tree.remove(&k_1));
+            assert_eq!(empty_tree.leaf_count, 0);
+            assert_eq!(empty_tree.root, Hash::default());
+        }
+
+        // Single element tree
+        {
+            let (k_1, v_1) = create_key_value(1);
+            let mut tree = PartialMerkleTrie::new();
+            tree.insert_or_replace(k_1, v_1);
+            
+            // Remove non-existent element
+            let (k_2, _) = create_key_value(2);
+            assert!(!tree.remove(&k_2));
+            assert_eq!(tree.leaf_count, 1);
+            
+            // Remove the only element
+            assert!(tree.remove(&k_1));
+            assert_eq!(tree.leaf_count, 0);
+            assert_eq!(tree.root, Hash::default());
+            assert!(tree.inner_store.is_empty());
+        }
+
+        // Two element tree
+        {
+            let (k_1, v_1) = create_key_value(1);
+            let (k_2, v_2) = create_key_value(2);
+            let mut tree = PartialMerkleTrie::new();
+            tree.insert_or_replace(k_1, v_1);
+            tree.insert_or_replace(k_2, v_2);
+            assert_eq!(tree.leaf_count, 2);
+            
+            // Remove first element
+            assert!(tree.remove(&k_1));
+            assert_eq!(tree.leaf_count, 1);
+            assert!(tree.get(&k_1).is_none());
+            assert!(tree.get(&k_2).is_some());
+            assert_eq!(tree.inner_store.len(), 1);
+            
+            // Remove last element
+            assert!(tree.remove(&k_2));
+            assert_eq!(tree.leaf_count, 0);
+            assert_eq!(tree.root, Hash::default());
+            assert!(tree.inner_store.is_empty());
+        }
+
+        // Simple batch remove
+        {
+            let (k_1, v_1) = create_key_value(1);
+            let (k_2, v_2) = create_key_value(2);
+            let (k_3, v_3) = create_key_value(3);
+            let mut tree = PartialMerkleTrie::new();
+            tree.insert_or_replace(k_1, v_1);
+            tree.insert_or_replace(k_2, v_2);
+            tree.insert_or_replace(k_3, v_3);
+            
+            let keys_to_remove = vec![&k_1, &k_3];
+            let removed_count = tree.remove_batch(keys_to_remove);
+            assert_eq!(removed_count, 2);
+            assert_eq!(tree.leaf_count, 1);
+            assert!(tree.get(&k_1).is_none());
+            assert!(tree.get(&k_2).is_some());
+            assert!(tree.get(&k_3).is_none());
+        }
+
+        // Remove non-existent from populated tree
+        {
+            let (k_1, v_1) = create_key_value(1);
+            let (k_2, v_2) = create_key_value(2);
+            let mut tree = PartialMerkleTrie::new();
+            tree.insert_or_replace(k_1, v_1);
+            tree.insert_or_replace(k_2, v_2);
+            
+            let (k_nonexistent, _) = create_key_value(10);
+            assert!(!tree.remove(&k_nonexistent));
+            assert_eq!(tree.leaf_count, 2);
+            
+            // Batch remove with mix
+            let mixed_keys = vec![&k_1, &k_nonexistent];
+            let removed_count = tree.remove_batch(mixed_keys);
+            assert_eq!(removed_count, 1);
+            assert_eq!(tree.leaf_count, 1);
+        }
     }
 }
 
