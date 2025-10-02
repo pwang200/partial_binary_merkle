@@ -10,3 +10,4 @@ serde = { version = "1.0.203", features = ["derive"] }
 
 [dev-dependencies]
 rand = "0.8.5"
+hex = "0.4"
